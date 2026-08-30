@@ -55,6 +55,28 @@
   let requestingCamera = false;
   let firstCameraAttempted = false;
 
+  const CameraPermission = window.CameraPermission || {
+    normalizePermissionState: (state) => {
+      if (state === 'granted' || state === 'denied' || state === 'prompt') return state;
+      return 'unknown';
+    },
+    canRequestCamera: ({ permissionState, forcePrompt = false, isEmbedded = false, isSecureContext = false, mediaDevicesSupported = false } = {}) => {
+      const state = this && this.normalizePermissionState ? this.normalizePermissionState(permissionState) : (
+        permissionState === 'granted' || permissionState === 'denied' || permissionState === 'prompt' ? permissionState : 'unknown'
+      );
+      if (isEmbedded) return { allowed: false, reason: 'embedded', state };
+      if (!isSecureContext) return { allowed: false, reason: 'insecure', state };
+      if (!mediaDevicesSupported) return { allowed: false, reason: 'missing-api', state };
+      if (state === 'denied' && !forcePrompt) return { allowed: false, reason: 'denied', state };
+      return { allowed: true, reason: 'request', state };
+    },
+    getPermissionRecoveryCopy: () => ({
+      denied: { title: 'Camera permission is blocked for this site.', help: 'Tap the lock or tune icon beside the address bar → Site settings → Camera → Allow, then return here and tap CHECK AGAIN. The app cannot change a browser-level denial itself.' },
+      embedded: { title: 'This page is running inside an embedded preview.', help: 'Open the deployed HTTPS URL in a normal browser tab, then tap ALLOW CAMERA.' },
+      insecure: { title: 'Camera access requires HTTPS.', help: 'Use the GitHub Pages HTTPS URL instead of an HTTP or preview URL.' }
+    })
+  };
+
   function setStatus(text) {
     statusText.textContent = text;
     statusDot.classList.toggle('live', text === 'LIVE');
@@ -109,7 +131,7 @@
           updatePermissionUi(permissionStatus.state);
         };
       }
-      return permissionStatus.state;
+      return CameraPermission.normalizePermissionState(permissionStatus?.state || 'unknown');
     } catch (err) {
       console.info('ThermoCellVision: camera permission query unavailable:', err);
       return 'unknown';
@@ -117,7 +139,9 @@
   }
 
   function updatePermissionUi(state) {
-    if (state === 'granted') {
+    const safeState = CameraPermission.normalizePermissionState(state);
+
+    if (safeState === 'granted') {
       btnRetry.textContent = 'START CAMERA';
       setPermissionMessage(
         cvReady ? 'Camera permission is granted.' : 'Camera permission is granted; waiting for the detection engine.',
@@ -126,16 +150,16 @@
       return;
     }
 
-    if (state === 'denied') {
+    if (safeState === 'denied') {
       btnRetry.textContent = 'CHECK AGAIN';
       setPermissionMessage(
         'Camera permission is blocked for this site.',
-        'Tap the lock/tune icon beside the address bar → Site settings → Camera → Allow, then return here and tap CHECK AGAIN. The app cannot change a browser-level denial itself.'
+        'Tap the lock or tune icon beside the address bar → Site settings → Camera → Allow, then return here and tap CHECK AGAIN. The app cannot change a browser-level denial itself.'
       );
       return;
     }
 
-    if (state === 'prompt') {
+    if (safeState === 'prompt') {
       btnRetry.textContent = 'ALLOW CAMERA';
       setPermissionMessage(
         'Camera permission has not been decided yet.',
@@ -145,6 +169,10 @@
     }
 
     btnRetry.textContent = 'TRY AGAIN';
+    setPermissionMessage(
+      'Camera permission is not confirmed yet.',
+      'Tap TRY AGAIN to re-check. If the browser blocks the request, the site permission must be changed in your browser settings.'
+    );
   }
 
   // ------------------------------------------------------------------
@@ -175,39 +203,46 @@
     setStatus('INITIALIZING');
     showPermScreen();
 
-    if (isEmbedded()) {
-      setPermissionMessage(
-        'This page is running inside an embedded preview.',
-        'Camera permission often cannot be requested from an embedded preview. Open the deployed HTTPS URL in a normal browser tab, then tap ALLOW CAMERA.',
-      );
-      btnOpenTab.hidden = false;
+    const permissionDecision = CameraPermission.canRequestCamera({
+      permissionState: permissionStatus?.state || 'unknown',
+      forcePrompt,
+      isEmbedded: isEmbedded(),
+      isSecureContext: window.isSecureContext,
+      mediaDevicesSupported: !!navigator.mediaDevices?.getUserMedia,
+    });
+
+    if (!permissionDecision.allowed) {
+      const recovery = CameraPermission.getPermissionRecoveryCopy()[permissionDecision.reason] || {
+        title: 'Camera access is unavailable right now.',
+        help: 'Use the browser permission controls to allow access, then tap CHECK AGAIN.'
+      };
+      setPermissionMessage(recovery.title, recovery.help);
+      btnOpenTab.hidden = permissionDecision.reason !== 'embedded';
+      if (permissionDecision.reason === 'denied') {
+        btnRetry.textContent = 'CHECK AGAIN';
+      }
       requestingCamera = false;
       return;
     }
     btnOpenTab.hidden = true;
 
-    if (!window.isSecureContext) {
-      setPermissionMessage(
-        'Camera access requires HTTPS (or localhost).',
-        'Use your GitHub Pages HTTPS URL, not an HTTP preview URL.'
-      );
-      requestingCamera = false;
-      return;
-    }
-
-    if (!navigator.mediaDevices?.getUserMedia) {
-      setPermissionMessage(
-        'This browser does not expose getUserMedia().',
-        'Use a current Chrome, Edge, Firefox, or Safari browser over HTTPS.'
-      );
-      requestingCamera = false;
-      return;
-    }
-
     const state = await queryCameraPermission();
+    const decision = CameraPermission.canRequestCamera({
+      permissionState: state,
+      forcePrompt,
+      isEmbedded: isEmbedded(),
+      isSecureContext: window.isSecureContext,
+      mediaDevicesSupported: !!navigator.mediaDevices?.getUserMedia,
+    });
 
-    if (state === 'denied' && !forcePrompt) {
-      updatePermissionUi('denied');
+    if (!decision.allowed) {
+      const recovery = CameraPermission.getPermissionRecoveryCopy()[decision.reason] || {
+        title: 'Camera access is unavailable right now.',
+        help: 'Use the browser permission controls to allow access, then tap CHECK AGAIN.'
+      };
+      setPermissionMessage(recovery.title, recovery.help);
+      if (decision.reason === 'denied') updatePermissionUi('denied');
+      else if (decision.reason === 'embedded') btnOpenTab.hidden = false;
       requestingCamera = false;
       return;
     }
@@ -216,7 +251,6 @@
       updatePermissionUi('prompt');
     }
 
-    // Stop an old stream before asking for a new one.
     stopCamera();
 
     let newStream = null;
@@ -224,8 +258,6 @@
       try {
         newStream = await navigator.mediaDevices.getUserMedia(buildPrimaryConstraints());
       } catch (primaryErr) {
-        // Don't hide an actual permission denial. A fallback is useful only
-        // for constraint/hardware-selection failures.
         const retryable = ['OverconstrainedError', 'ConstraintNotSatisfiedError', 'NotFoundError'].includes(primaryErr?.name);
         if (!retryable) throw primaryErr;
         console.info('ThermoCellVision: retrying with generic camera constraints:', primaryErr);
@@ -262,8 +294,12 @@
     const name = err?.name || 'UnknownError';
 
     if (name === 'NotAllowedError' || name === 'PermissionDeniedError' || name === 'SecurityError') {
-      await queryCameraPermission();
-      updatePermissionUi('denied');
+      const state = await queryCameraPermission();
+      if (state === 'denied') {
+        updatePermissionUi('denied');
+      } else {
+        updatePermissionUi(state || 'prompt');
+      }
       return;
     }
 
@@ -456,15 +492,17 @@
   btnRetry.addEventListener('click', async () => {
     const state = await queryCameraPermission();
 
-    // Once a site permission was changed to Allow, this click immediately
-    // opens the camera. If still denied, we explain why another prompt cannot
-    // be forced from JavaScript.
-    if (state === 'granted') {
+    if (state === 'denied') {
+      updatePermissionUi('denied');
+      return;
+    }
+
+    if (state === 'granted' || state === 'prompt' || state === 'unknown') {
       await requestCamera({ forcePrompt: true });
       return;
     }
 
-    await requestCamera({ forcePrompt: state !== 'denied' });
+    await requestCamera({ forcePrompt: true });
   });
 
   btnOpenTab.addEventListener('click', openInTopLevelTab);
