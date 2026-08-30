@@ -16,12 +16,23 @@ html, body {
 .screen.hidden { display: none; }
 
 /* ---------------- camera + canvas ---------------- */
-#video { display: none; } /* source only, never shown directly */
+#video {
+  position: absolute; inset: 0;
+  width: 100%; height: 100%;
+  object-fit: cover; display: none;
+  pointer-events: none; z-index: 0;
+}
 #output {
   position: absolute; inset: 0;
   width: 100%; height: 100%;
+  height: 100%;
   object-fit: cover;
   background: #08090d;
+  z-index: 1;
+}
+#screen-camera {
+  background: #08090d;
+  z-index: 0;
 }
 
 /* ---------------- glass panel base ---------------- */

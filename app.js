@@ -391,33 +391,64 @@
     showPermScreen();
   }
 
-  function onVideoReady() {
-    console.log('ThermoCellVision: onVideoReady fired', { cameraActive, cvReady, videoWidth: video.videoWidth, videoHeight: video.videoHeight, readyState: video.readyState });
-    if (!cvReady || typeof cv === 'undefined' || !cv.Mat) {
-      console.warn('ThermoCellVision: CV not ready yet; keeping camera visible while detection loads');
-      setStatus('LOADING DETECTION');
-      return;
+  function ensureCanvasSize() {
+    const width = video.videoWidth || 1280;
+    const height = video.videoHeight || 720;
+    if (canvas.width !== width || canvas.height !== height) {
+      canvas.width = width;
+      canvas.height = height;
+      console.log('ThermoCellVision: canvas resized to', { width, height });
+    }
+  }
+
+  function paintRawCameraFrame() {
+    if (!video || !video.videoWidth || !video.videoHeight) {
+      return false;
     }
 
-    const width = video.videoWidth;
-    const height = video.videoHeight;
-    if (!width || !height) {
+    ensureCanvasSize();
+    const ctx = canvas.getContext('2d');
+    if (!ctx) {
+      console.warn('ThermoCellVision: 2D canvas context unavailable');
+      return false;
+    }
+
+    try {
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+      return true;
+    } catch (err) {
+      console.warn('ThermoCellVision: drawImage failed during raw camera fallback:', err);
+      return false;
+    }
+  }
+
+  function onVideoReady() {
+    console.log('ThermoCellVision: onVideoReady fired', { cameraActive, cvReady, videoWidth: video.videoWidth, videoHeight: video.videoHeight, readyState: video.readyState });
+    if (!video.videoWidth || !video.videoHeight) {
       console.warn('ThermoCellVision: video dimensions missing; camera stream is active but not usable yet');
       setStatus('WAITING FOR CAMERA');
       return;
     }
 
-    canvas.width = width;
-    canvas.height = height;
+    ensureCanvasSize();
+    const width = video.videoWidth;
+    const height = video.videoHeight;
 
-    if (frameMat) { frameMat.delete(); frameMat = null; }
-    frameMat = new cv.Mat(height, width, cv.CV_8UC4);
-    cap = new cv.VideoCapture(video);
+    if (!cvReady || typeof cv === 'undefined' || !cv.Mat || !cv.VideoCapture || !cv.imshow) {
+      console.warn('ThermoCellVision: OpenCV not ready yet; drawing raw camera feed while detection loads');
+      setStatus('LOADING DETECTION');
+      paintRawCameraFrame();
+    } else {
+      if (frameMat) { frameMat.delete(); frameMat = null; }
+      frameMat = new cv.Mat(height, width, cv.CV_8UC4);
+      cap = new cv.VideoCapture(video);
 
-    if (!detector) detector = new HeatRegionDetector(320);
+      if (!detector) detector = new HeatRegionDetector(320);
 
-    console.log('ThermoCellVision: detector initialized and capture loop starting');
-    setStatus('LIVE');
+      console.log('ThermoCellVision: detector initialized and capture pipeline ready');
+      setStatus('LIVE');
+    }
+
     if (!running) {
       running = true;
       requestAnimationFrame(loop);
@@ -457,30 +488,55 @@
   function loop() {
     if (!running) return;
 
-    if (cap && frameMat && detector && video.readyState >= 2 && video.videoWidth > 0) {
-      if (!(paused && !scanRequested)) {
-        cap.read(frameMat);
+    try {
+      if (cap && frameMat && detector && video.readyState >= 2 && video.videoWidth > 0) {
+        if (!(paused && !scanRequested)) {
+          const readOk = cap.read(frameMat);
+          console.log('ThermoCellVision: cap.read()', { readOk, width: frameMat?.cols, height: frameMat?.rows, readyState: video.readyState });
 
-        let result = null;
-        try {
-          if (scanRequested) detector.reset();
-          result = detector.process(frameMat);
-          scanRequested = false;
+          let result = null;
+          try {
+            if (scanRequested) detector.reset();
+            result = detector.process(frameMat);
+            scanRequested = false;
 
-          cv.imshow(canvas, result.frame);
-          pushStats(result.hotDetected, result.placementRecommended, result.confidence);
-        } catch (err) {
-          console.error('ThermoCellVision: CV frame processing failed:', err);
-          setStatus('ERROR');
-          statusHot.textContent = 'DETECTION ERROR';
-          statusPlace.textContent = 'PLACEMENT: PAUSED';
-          if (scanRequested) scanRequested = false;
-        } finally {
-          if (result?.frame) {
-            try { result.frame.delete(); } catch (_) {}
+            if (!result || !result.frame) {
+              console.warn('ThermoCellVision: detector.process() returned no result.frame; drawing raw feed fallback');
+              paintRawCameraFrame();
+            } else {
+              console.log('ThermoCellVision: detector.process() produced overlay frame', {
+                hotDetected: result.hotDetected,
+                placementRecommended: result.placementRecommended,
+                confidence: result.confidence,
+                surfaceFound: result.surfaceFound,
+                frameRows: result.frame.rows,
+                frameCols: result.frame.cols
+              });
+              cv.imshow(canvas, result.frame);
+              pushStats(result.hotDetected, result.placementRecommended, result.confidence);
+            }
+          } catch (err) {
+            console.error('ThermoCellVision: CV frame processing failed:', err);
+            paintRawCameraFrame();
+            setStatus('ERROR');
+            statusHot.textContent = 'DETECTION ERROR';
+            statusPlace.textContent = 'PLACEMENT: PAUSED';
+            if (scanRequested) scanRequested = false;
+          } finally {
+            if (result?.frame) {
+              try { result.frame.delete(); } catch (_) {}
+            }
           }
         }
+      } else {
+        const painted = paintRawCameraFrame();
+        if (painted) {
+          console.log('ThermoCellVision: raw camera feed rendered to canvas while OpenCV is loading or unavailable');
+        }
       }
+    } catch (outerErr) {
+      console.error('ThermoCellVision: render loop failed:', outerErr);
+      paintRawCameraFrame();
     }
 
     requestAnimationFrame(loop);
