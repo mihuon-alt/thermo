@@ -54,6 +54,8 @@
   let permissionStatus = null;
   let requestingCamera = false;
   let firstCameraAttempted = false;
+  let cameraActive = false;
+  let cameraStartToken = 0;
 
   const CameraPermission = window.CameraPermission || {
     normalizePermissionState: (state) => {
@@ -83,11 +85,13 @@
   }
 
   function showPermScreen() {
+    console.log('ThermoCellVision: showing permission screen');
     screenCamera.classList.add('hidden');
     screenPermission.classList.remove('hidden');
   }
 
   function hidePermScreen() {
+    console.log('ThermoCellVision: hiding permission screen and showing camera view');
     screenPermission.classList.add('hidden');
     screenCamera.classList.remove('hidden');
   }
@@ -196,10 +200,21 @@
   }
 
   async function requestCamera({forcePrompt = false} = {}) {
-    if (requestingCamera) return;
+    if (requestingCamera) {
+      console.log('ThermoCellVision: camera request already in progress; ignoring duplicate start');
+      return;
+    }
+    if (cameraActive && stream && video.srcObject) {
+      console.log('ThermoCellVision: camera already active; ignoring duplicate start');
+      hidePermScreen();
+      return;
+    }
+
+    const requestToken = ++cameraStartToken;
     requestingCamera = true;
     firstCameraAttempted = true;
 
+    console.log('ThermoCellVision: requestCamera start', { requestToken, forcePrompt, cameraActive, isEmbedded: isEmbedded(), isSecureContext: window.isSecureContext });
     setStatus('INITIALIZING');
     showPermScreen();
 
@@ -216,6 +231,7 @@
         title: 'Camera access is unavailable right now.',
         help: 'Use the browser permission controls to allow access, then tap CHECK AGAIN.'
       };
+      console.warn('ThermoCellVision: requestCamera blocked before getUserMedia()', { requestToken, reason: permissionDecision.reason, state: permissionDecision.state });
       setPermissionMessage(recovery.title, recovery.help);
       btnOpenTab.hidden = permissionDecision.reason !== 'embedded';
       if (permissionDecision.reason === 'denied') {
@@ -227,6 +243,7 @@
     btnOpenTab.hidden = true;
 
     const state = await queryCameraPermission();
+    console.log('ThermoCellVision: permission check result', { requestToken, state, forcePrompt });
     const decision = CameraPermission.canRequestCamera({
       permissionState: state,
       forcePrompt,
@@ -240,6 +257,7 @@
         title: 'Camera access is unavailable right now.',
         help: 'Use the browser permission controls to allow access, then tap CHECK AGAIN.'
       };
+      console.warn('ThermoCellVision: requestCamera blocked after permission query', { requestToken, reason: decision.reason, state: decision.state });
       setPermissionMessage(recovery.title, recovery.help);
       if (decision.reason === 'denied') updatePermissionUi('denied');
       else if (decision.reason === 'embedded') btnOpenTab.hidden = false;
@@ -256,6 +274,7 @@
     let newStream = null;
     try {
       try {
+        console.log('ThermoCellVision: requesting getUserMedia with primary constraints', { requestToken, frontCamera });
         newStream = await navigator.mediaDevices.getUserMedia(buildPrimaryConstraints());
       } catch (primaryErr) {
         const retryable = ['OverconstrainedError', 'ConstraintNotSatisfiedError', 'NotFoundError'].includes(primaryErr?.name);
@@ -267,21 +286,47 @@
       stream = newStream;
       track = stream.getVideoTracks()[0];
       if (!track) throw new DOMException('No video track returned.', 'NotFoundError');
-
       const caps = track.getCapabilities ? track.getCapabilities() : {};
       torchSupported = !!caps.torch;
       torchOn = false;
       btnTorch.disabled = !torchSupported;
       btnTorch.classList.remove('active');
 
-      video.srcObject = stream;
-      await video.play();
+      console.log('ThermoCellVision: getUserMedia succeeded', { requestToken, streamId: stream.id, trackCount: stream.getVideoTracks().length, readyState: video.readyState });
 
+      video.srcObject = stream;
+      video.muted = true;
+      video.playsInline = true;
+      video.autoplay = true;
+      video.setAttribute('playsinline', 'true');
+      video.setAttribute('autoplay', 'true');
+
+      video.onloadedmetadata = () => {
+        console.log('ThermoCellVision: video loadedmetadata', { width: video.videoWidth, height: video.videoHeight, readyState: video.readyState });
+      };
+      video.oncanplay = () => {
+        console.log('ThermoCellVision: video canplay', { width: video.videoWidth, height: video.videoHeight, readyState: video.readyState });
+      };
+
+      try {
+        await video.play();
+        console.log('ThermoCellVision: video.play() succeeded; camera startup complete');
+      } catch (playErr) {
+        console.warn('ThermoCellVision: video.play() rejected', playErr);
+        throw playErr;
+      }
+
+      cameraActive = true;
       hidePermScreen();
       setPermissionMessage('');
+      setStatus('LIVE');
       video.addEventListener('loadedmetadata', onVideoReady, { once: true });
+      video.addEventListener('canplay', () => {
+        if (video.videoWidth && video.videoHeight) onVideoReady();
+      }, { once: true });
       if (video.videoWidth && video.videoHeight) onVideoReady();
     } catch (err) {
+      cameraActive = false;
       console.warn('ThermoCellVision: camera start failed:', err);
       stopCamera();
       await handleCameraError(err);
@@ -347,15 +392,18 @@
   }
 
   function onVideoReady() {
+    console.log('ThermoCellVision: onVideoReady fired', { cameraActive, cvReady, videoWidth: video.videoWidth, videoHeight: video.videoHeight, readyState: video.readyState });
     if (!cvReady || typeof cv === 'undefined' || !cv.Mat) {
-      showPermError('Camera is ready, but the detection engine is still loading. Please wait a moment.');
+      console.warn('ThermoCellVision: CV not ready yet; keeping camera visible while detection loads');
+      setStatus('LOADING DETECTION');
       return;
     }
 
     const width = video.videoWidth;
     const height = video.videoHeight;
     if (!width || !height) {
-      showPermError('Camera opened but did not report a usable video size.');
+      console.warn('ThermoCellVision: video dimensions missing; camera stream is active but not usable yet');
+      setStatus('WAITING FOR CAMERA');
       return;
     }
 
@@ -368,6 +416,7 @@
 
     if (!detector) detector = new HeatRegionDetector(320);
 
+    console.log('ThermoCellVision: detector initialized and capture loop starting');
     setStatus('LIVE');
     if (!running) {
       running = true;
@@ -376,7 +425,9 @@
   }
 
   function stopCamera() {
+    console.log('ThermoCellVision: stopCamera called');
     running = false;
+    cameraActive = false;
 
     if (stream) {
       stream.getTracks().forEach((t) => {
@@ -490,15 +541,18 @@
   });
 
   btnRetry.addEventListener('click', async () => {
+    console.log('ThermoCellVision: retry button clicked');
     const state = await queryCameraPermission();
+    console.log('ThermoCellVision: retry button permission state', { state, cameraActive });
 
     if (state === 'denied') {
       updatePermissionUi('denied');
       return;
     }
 
-    if (state === 'granted' || state === 'prompt' || state === 'unknown') {
-      await requestCamera({ forcePrompt: true });
+    if (cameraActive && stream && video.srcObject) {
+      console.log('ThermoCellVision: retry ignored because camera is already active');
+      hidePermScreen();
       return;
     }
 
@@ -526,6 +580,7 @@
     }
     if (!stream && cvReady) {
       const state = await queryCameraPermission();
+      console.log('ThermoCellVision: visibilitychange camera resume check', { state, cameraActive, streamPresent: !!stream });
       if (state !== 'denied') await requestCamera({ forcePrompt: state !== 'denied' });
       else updatePermissionUi('denied');
     }
